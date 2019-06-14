@@ -2,7 +2,7 @@
 
 steps:
   - mkimg: "{{ output }}"
-    size: 1500M
+    size: 2048M
 
   - mklabel: msdos
     device: "{{ output }}"
@@ -11,12 +11,12 @@ steps:
     fs-type: 'fat32'
     device: "{{ output }}"
     start: 0%
-    end: 20%
+    end: 10%
     tag: /boot
 
   - mkpart: primary
     device: "{{ output }}"
-    start: 20%
+    start: 10%
     end: 100%
     tag: /
 
@@ -24,11 +24,11 @@ steps:
 
   - mkfs: vfat
     partition: /boot
-    label: RASPIFIRM
+    label: BOOT
 
-  - mkfs: ext4
+  - mkfs: f2fs
     partition: /
-    label: RASPIROOT
+    label: ROOT
 
   - mount: /
 
@@ -65,14 +65,22 @@ steps:
   # debootstrap is fixed
   - chroot: /
     shell: |
-      echo 'deb http://deb.debian.org/debian buster main contrib non-free' > /etc/apt/sources.list
+      cat >/etc/apt/sources.list <<EOT
+      deb http://deb.debian.org/debian buster main contrib non-free
+      deb http://deb.debian.org/debian buster-updates main contrib non-free
+      deb http://deb.debian.org/debian-security buster/updates main contrib non-free
+      EOT
       apt-get update
+      echo do_symlinks = no >/etc/kernel-img.conf
     unless: rootfs_unpacked
 
   - apt: install
     packages:
     - ssh
+    # For partprobe:
     - parted
+    - fdisk
+    - f2fs-tools
     - dosfstools
     # Contains /lib/firmware/brcm/brcmfmac43430-sdio.bin (required for WiFi).
     - firmware-brcm80211
@@ -80,60 +88,91 @@ steps:
     - wpasupplicant
     - raspi3-firmware
     - linux-image-arm64
+    - puppet
+    - resolvconf
+    - ntpdate
     tag: /
     unless: rootfs_unpacked
 
+  - shell: |
+      set -ex
+
+      rm -f "${ROOT?}/etc/resolv.conf"
+    root-fs: /
+
+    unless: rootfs_unpacked
+
   - cache-rootfs: /
+    options: ''
     unless: rootfs_unpacked
 
   - shell: |
-      echo "rpi3" > "${ROOT?}/etc/hostname"
+      set -ex
 
-      # '..VyaTFxP8kT6' is crypt.crypt('raspberry', '..')
-      sed -i 's,root:[^:]*,root:..VyaTFxP8kT6,' "${ROOT?}/etc/shadow"
+      # trigger /sbin/dhclient-script to set the hostname
+      echo localhost >"${ROOT?}/etc/hostname"
 
-      sed -i 's,#PermitRootLogin prohibit-password,PermitRootLogin yes,g' "${ROOT?}/etc/ssh/sshd_config"
+      sed -i 's,root:[^:]*,root:*,' "${ROOT?}/etc/shadow"
+      sed -i 's,^#\(HostKey /etc/ssh/ssh_host_ed25519_key\),\1,' "${ROOT?}/etc/ssh/sshd_config"
+
+      echo "f2fs" >>"${ROOT?}/etc/initramfs-tools/modules"
 
       install -m 644 -o root -g root fstab "${ROOT?}/etc/fstab"
 
       install -m 644 -o root -g root eth0 "${ROOT?}/etc/network/interfaces.d/eth0"
 
-      mkdir -p "${ROOT?}/etc/iptables"
-      install -m 644 -o root -g root rules.v4 "${ROOT?}/etc/iptables/rules.v4"
-      install -m 644 -o root -g root rules.v6 "${ROOT?}/etc/iptables/rules.v6"
+      #mkdir -p "${ROOT?}/etc/systemd/system/systemd-remount-fs.service.requires"
+      #install -m 644 -o root -g root rpi3-resizerootfs.service "${ROOT?}/etc/systemd/system/"
+      #ln -s ../rpi3-resizerootfs.service "${ROOT?}/etc/systemd/system/systemd-remount-fs.service.requires/rpi3-resizerootfs.service"
 
-      install -m 755 -o root -g root rpi3-resizerootfs "${ROOT?}/usr/sbin/rpi3-resizerootfs"
-      install -m 644 -o root -g root rpi3-resizerootfs.service "${ROOT?}/etc/systemd/system"
-      mkdir -p "${ROOT?}/etc/systemd/system/systemd-remount-fs.service.requires/"
-      ln -s /etc/systemd/system/rpi3-resizerootfs.service "${ROOT?}/etc/systemd/system/systemd-remount-fs.service.requires/rpi3-resizerootfs.service"
+      install -m 755 -o root -g root rpi3-resizerootfs.hook "${ROOT?}/usr/share/initramfs-tools/hooks/rpi3-resizerootfs"
+      install -m 755 -o root -g root rpi3-resizerootfs.sh "${ROOT?}/usr/share/initramfs-tools/scripts/local-premount/rpi3-resizerootfs"
 
-      install -m 644 -o root -g root rpi3-generate-ssh-host-keys.service "${ROOT?}/etc/systemd/system"
-      mkdir -p "${ROOT?}/etc/systemd/system/multi-user.target.requires/"
-      ln -s /etc/systemd/system/rpi3-generate-ssh-host-keys.service "${ROOT?}/etc/systemd/system/multi-user.target.requires/rpi3-generate-ssh-host-keys.service"
-      rm -f ${ROOT?}/etc/ssh/ssh_host_*_key*
+      mkdir -p "${ROOT?}/etc/systemd/system/multi-user.target.requires"
+      install -m 644 -o root -g root rpi3-generate-ssh-host-keys.service "${ROOT?}/etc/systemd/system/"
+      ln -s ../rpi3-generate-ssh-host-keys.service "${ROOT?}/etc/systemd/system/multi-user.target.requires/rpi3-generate-ssh-host-keys.service"
 
-      cat >> "${ROOT?}/etc/motd" <<'EOT'
+      rm -f -- "${ROOT?}"/etc/ssh/ssh_host_*_key*
 
-      Please change the root password by running passwd
+      mkdir -m 700 -p "${ROOT?}/root/.ssh"
+      cat >"${ROOT?}/root/.ssh/authorized_keys" <<EOT
+      ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMivjLmbkKTgoAa2kNnsOU6OrhWMosUXWTcE3X2hAW0T wsl@thecheat.uvt.nl
       EOT
+
+      echo "server = sohnano.uvt.nl" >>"${ROOT?}/etc/puppet/puppet.conf"
+
+      mkdir -p "${ROOT?}/var/lib/puppet/ssl/certs"
+      install -m 644 -o root -g root ca.pem "${ROOT?}/var/lib/puppet/ssl/certs/ca.pem"
+
     root-fs: /
+
+  - mount-virtual-filesystems: /
+
+  - chroot: /
+    shell: |
+      chown -R puppet: /var/lib/puppet
+      update-initramfs -k all -u
+      rm -f /boot/*.bak
+      rm /usr/share/initramfs-tools/hooks/rpi3-resizerootfs
+      rm /usr/share/initramfs-tools/scripts/local-premount/rpi3-resizerootfs
 
   # Clean up archive cache (likely not useful) and lists (likely outdated) to
   # reduce image size by several hundred megabytes.
   - chroot: /
     shell: |
       apt-get clean
-      rm -rf /var/lib/apt/lists
+      find /var/lib/apt/lists -type f -delete
 
   # Modify the kernel commandline we take from the firmware to boot from
   # the partition labeled raspiroot instead of forcing it to mmcblk0p2
   - chroot: /
     shell: |
-      ls -aR /boot
-      sed -i 's/.dev.mmcblk0p2/LABEL=RASPIROOT/' /boot/firmware/cmdline.txt
+      sed -i 's,/dev/mmcblk0p2,LABEL=ROOT quiet,' /boot/firmware/cmdline.txt
+      echo 'console=tty0 root=LABEL=ROOT quiet rw elevator=deadline fsck.repair=yes net.ifnames=0 cma=64M rootwait' >/boot/firmware/cmdline.txt
 
   # TODO(https://github.com/larswirzenius/vmdb2/issues/24): remove once vmdb
   # clears /etc/resolv.conf on its own.
   - shell: |
-      rm "${ROOT?}/etc/resolv.conf"
+      rm -f "${ROOT?}/etc/resolv.conf"
+      ln -s /etc/resolvconf/run/resolv.conf "${ROOT?}/etc/resolv.conf"
     root-fs: /
